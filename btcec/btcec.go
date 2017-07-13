@@ -46,6 +46,9 @@ type KoblitzCurve struct {
 	// bytePoints
 	bytePoints *[32][256][3]fieldVal
 
+	// bytePointsH
+	bytePointsH *[32][256][3]fieldVal
+
 	// The next 6 values are used specifically for endomorphism
 	// optimizations in ScalarMult.
 
@@ -878,6 +881,28 @@ func (curve *KoblitzCurve) ScalarBaseMult(k []byte) (*big.Int, *big.Int) {
 	return curve.fieldJacobianToBigAffine(qx, qy, qz)
 }
 
+// ScalarBaseMult returns k*H where H is a base point of the group and k is a
+// big endian integer.
+// NOT part of the elliptic.Curve interface.
+func (curve *KoblitzCurve) ScalarBaseMultH(k []byte) (*big.Int, *big.Int) {
+	newK := curve.moduloReduce(k)
+	diff := len(curve.bytePointsH) - len(newK)
+
+	// Point Q = ∞ (point at infinity).
+	qx, qy, qz := new(fieldVal), new(fieldVal), new(fieldVal)
+
+	// curve.bytePoints has all 256 byte points for each 8-bit window. The
+	// strategy is to add up the byte points. This is best understood by
+	// expressing k in base-256 which it already sort of is.
+	// Each "digit" in the 8-bit window can be looked up using bytePoints
+	// and added together.
+	for i, byteVal := range newK {
+		p := curve.bytePointsH[diff+i][byteVal]
+		curve.addJacobian(qx, qy, qz, &p[0], &p[1], &p[2], qx, qy, qz)
+	}
+	return curve.fieldJacobianToBigAffine(qx, qy, qz)
+}
+
 // QPlus1Div4 returns the Q+1/4 constant for the curve for use in calculating
 // square roots via exponention.
 func (curve *KoblitzCurve) QPlus1Div4() *big.Int {
@@ -923,6 +948,10 @@ func initS256() {
 	// base multiplication.  This is hard-coded data, so any errors are
 	// panics because it means something is wrong in the source code.
 	if err := loadS256BytePoints(); err != nil {
+		panic(err)
+	}
+
+	if err := loadS256BytePointsH(); err != nil {
 		panic(err)
 	}
 
