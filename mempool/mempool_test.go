@@ -23,7 +23,7 @@ import (
 
 // fakeChain is used by the pool harness to provide generated test utxos and
 // a current faked chain height to the pool callbacks.  This, in turn, allows
-// transations to be appear as though they are spending completely valid utxos.
+// transactions to appear as though they are spending completely valid utxos.
 type fakeChain struct {
 	sync.RWMutex
 	utxos          *blockchain.UtxoViewpoint
@@ -310,7 +310,7 @@ func newPoolHarness(chainParams *chaincfg.Params) (*poolHarness, []spendableOutp
 				FreeTxRelayLimit:     15.0,
 				MaxOrphanTxs:         5,
 				MaxOrphanTxSize:      1000,
-				MaxSigOpsPerTx:       blockchain.MaxSigOpsPerBlock / 5,
+				MaxSigOpCostPerTx:    blockchain.MaxBlockSigOpsCost / 4,
 				MinRelayTxFee:        1000, // 1 Satoshi per byte
 				MaxTxVersion:         1,
 			},

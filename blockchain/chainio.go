@@ -12,14 +12,24 @@ import (
 	"sort"
 	"time"
 
-	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 )
 
+const (
+	// blockHdrSize is the size of a block header.  This is simply the
+	// constant from wire and is only provided here for convenience since
+	// wire.MaxBlockHeaderPayload is quite long.
+	blockHdrSize = wire.MaxBlockHeaderPayload
+)
+
 var (
+	// blockIndexBucketName is the name of the db bucket used to house to the
+	// block headers and contextual information.
+	blockIndexBucketName = []byte("blockheaderidx")
+
 	// hashIndexBucketName is the name of the db bucket used to house to the
 	// block hash -> block height index.
 	hashIndexBucketName = []byte("hashidx")
@@ -39,27 +49,6 @@ var (
 	// utxoSetBucketName is the name of the db bucket used to house the
 	// unspent transaction output set.
 	utxoSetBucketName = []byte("utxoset")
-
-	// thresholdBucketName is the name of the db bucket used to house cached
-	// threshold states.
-	thresholdBucketName = []byte("thresholdstate")
-
-	// numDeploymentsKeyName is the name of the db key used to store the
-	// number of saved deployment caches.
-	numDeploymentsKeyName = []byte("numdeployments")
-
-	// deploymentBucketName is the name of the db bucket used to house the
-	// cached threshold states for the actively defined rule deployments.
-	deploymentBucketName = []byte("deploymentcache")
-
-	// deploymentStateKeyName is the name of the db key used to store the
-	// deployment state associated with the threshold cache for a given rule
-	// deployment.
-	deploymentStateKeyName = []byte("deploymentstate")
-
-	// warningBucketName is the name of the db bucket used to house the
-	// cached threshold states for unknown rule deployments.
-	warningBucketName = []byte("warningcache")
 
 	// byteOrder is the preferred byte order used for serializing numeric
 	// fields for storage in the database.
@@ -1080,28 +1069,37 @@ func dbPutBestState(dbTx database.Tx, snapshot *BestState, workSum *big.Int) err
 func (b *BlockChain) createChainState() error {
 	// Create a new node from the genesis block and set it as the best node.
 	genesisBlock := btcutil.NewBlock(b.chainParams.GenesisBlock)
+	genesisBlock.SetHeight(0)
 	header := &genesisBlock.MsgBlock().Header
-	node := newBlockNode(header, genesisBlock.Hash(), 0)
-	node.inMainChain = true
-	b.bestNode = node
+	node := newBlockNode(header, nil)
+	node.status = statusDataStored | statusValid
+	b.bestChain.SetTip(node)
 
 	// Add the new node to the index which is used for faster lookups.
-	b.index.AddNode(node)
+	b.index.addNode(node)
 
 	// Initialize the state related to the best block.  Since it is the
 	// genesis block, use its timestamp for the median time.
 	numTxns := uint64(len(genesisBlock.MsgBlock().Transactions))
 	blockSize := uint64(genesisBlock.MsgBlock().SerializeSize())
-	b.stateSnapshot = newBestState(b.bestNode, blockSize, numTxns, numTxns,
-		time.Unix(b.bestNode.timestamp, 0))
+	blockWeight := uint64(GetBlockWeight(genesisBlock))
+	b.stateSnapshot = newBestState(node, blockSize, blockWeight, numTxns,
+		numTxns, time.Unix(node.timestamp, 0))
 
 	// Create the initial the database chain state including creating the
 	// necessary index buckets and inserting the genesis block.
 	err := b.db.Update(func(dbTx database.Tx) error {
+		meta := dbTx.Metadata()
+
+		// Create the bucket that houses the block index data.
+		_, err := meta.CreateBucket(blockIndexBucketName)
+		if err != nil {
+			return err
+		}
+
 		// Create the bucket that houses the chain block hash to height
 		// index.
-		meta := dbTx.Metadata()
-		_, err := meta.CreateBucket(hashIndexBucketName)
+		_, err = meta.CreateBucket(hashIndexBucketName)
 		if err != nil {
 			return err
 		}
@@ -1127,21 +1125,27 @@ func (b *BlockChain) createChainState() error {
 			return err
 		}
 
+		// Save the genesis block to the block index database.
+		err = dbStoreBlockNode(dbTx, node)
+		if err != nil {
+			return err
+		}
+
 		// Add the genesis block hash to height and height to hash
 		// mappings to the index.
-		err = dbPutBlockIndex(dbTx, &b.bestNode.hash, b.bestNode.height)
+		err = dbPutBlockIndex(dbTx, &node.hash, node.height)
 		if err != nil {
 			return err
 		}
 
 		// Store the current best chain state into the database.
-		err = dbPutBestState(dbTx, b.stateSnapshot, b.bestNode.workSum)
+		err = dbPutBestState(dbTx, b.stateSnapshot, node.workSum)
 		if err != nil {
 			return err
 		}
 
 		// Store the genesis block into the database.
-		return dbTx.StoreBlock(genesisBlock)
+		return dbStoreBlock(dbTx, genesisBlock)
 	})
 	return err
 }
@@ -1150,22 +1154,113 @@ func (b *BlockChain) createChainState() error {
 // database.  When the db does not yet contain any chain state, both it and the
 // chain state are initialized to the genesis block.
 func (b *BlockChain) initChainState() error {
-	// Attempt to load the chain state from the database.
-	var isStateInitialized bool
+	// Determine the state of the chain database. We may need to initialize
+	// everything from scratch or upgrade certain buckets.
+	var initialized, hasBlockIndex bool
 	err := b.db.View(func(dbTx database.Tx) error {
+		initialized = dbTx.Metadata().Get(chainStateKeyName) != nil
+		hasBlockIndex = dbTx.Metadata().Bucket(blockIndexBucketName) != nil
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if !initialized {
+		// At this point the database has not already been initialized, so
+		// initialize both it and the chain state to the genesis block.
+		return b.createChainState()
+	}
+
+	if !hasBlockIndex {
+		err := migrateBlockIndex(b.db)
+		if err != nil {
+			return nil
+		}
+	}
+
+	// Attempt to load the chain state from the database.
+	return b.db.View(func(dbTx database.Tx) error {
 		// Fetch the stored chain state from the database metadata.
 		// When it doesn't exist, it means the database hasn't been
 		// initialized for use with chain yet, so break out now to allow
 		// that to happen under a writable database transaction.
 		serializedData := dbTx.Metadata().Get(chainStateKeyName)
-		if serializedData == nil {
-			return nil
-		}
 		log.Tracef("Serialized chain state: %x", serializedData)
 		state, err := deserializeBestChainState(serializedData)
 		if err != nil {
 			return err
 		}
+
+		// Load all of the headers from the data for the known best
+		// chain and construct the block index accordingly.  Since the
+		// number of nodes are already known, perform a single alloc
+		// for them versus a whole bunch of little ones to reduce
+		// pressure on the GC.
+		log.Infof("Loading block index...")
+
+		blockIndexBucket := dbTx.Metadata().Bucket(blockIndexBucketName)
+
+		// Determine how many blocks will be loaded into the index so we can
+		// allocate the right amount.
+		var blockCount int32
+		cursor := blockIndexBucket.Cursor()
+		for ok := cursor.First(); ok; ok = cursor.Next() {
+			blockCount++
+		}
+		blockNodes := make([]blockNode, blockCount)
+
+		var i int32
+		var lastNode *blockNode
+		cursor = blockIndexBucket.Cursor()
+		for ok := cursor.First(); ok; ok = cursor.Next() {
+			header, status, err := deserializeBlockRow(cursor.Value())
+			if err != nil {
+				return err
+			}
+
+			// Determine the parent block node. Since we iterate block headers
+			// in order of height, if the blocks are mostly linear there is a
+			// very good chance the previous header processed is the parent.
+			var parent *blockNode
+			if lastNode == nil {
+				blockHash := header.BlockHash()
+				if !blockHash.IsEqual(b.chainParams.GenesisHash) {
+					return AssertError(fmt.Sprintf("initChainState: Expected "+
+						"first entry in block index to be genesis block, "+
+						"found %s", blockHash))
+				}
+			} else if header.PrevBlock == lastNode.hash {
+				// Since we iterate block headers in order of height, if the
+				// blocks are mostly linear there is a very good chance the
+				// previous header processed is the parent.
+				parent = lastNode
+			} else {
+				parent = b.index.LookupNode(&header.PrevBlock)
+				if parent == nil {
+					return AssertError(fmt.Sprintf("initChainState: Could "+
+						"not find parent for block %s", header.BlockHash()))
+				}
+			}
+
+			// Initialize the block node for the block, connect it,
+			// and add it to the block index.
+			node := &blockNodes[i]
+			initBlockNode(node, header, parent)
+			node.status = status
+			b.index.addNode(node)
+
+			lastNode = node
+			i++
+		}
+
+		// Set the best chain view to the stored best state.
+		tip := b.index.LookupNode(&state.hash)
+		if tip == nil {
+			return AssertError(fmt.Sprintf("initChainState: cannot find "+
+				"chain tip %s in block index", state.hash))
+		}
+		b.bestChain.SetTip(tip)
 
 		// Load the raw block bytes for the best block.
 		blockBytes, err := dbTx.FetchBlock(&state.hash)
@@ -1178,44 +1273,34 @@ func (b *BlockChain) initChainState() error {
 			return err
 		}
 
-		// Create a new node and set it as the best node.  The preceding
-		// nodes will be loaded on demand as needed.
-		header := &block.Header
-		node := newBlockNode(header, &state.hash, int32(state.height))
-		node.inMainChain = true
-		node.workSum = state.workSum
-		b.bestNode = node
-
-		// Add the new node to the block index.
-		b.index.AddNode(node)
-
-		// Calculate the median time for the block.
-		medianTime, err := b.index.CalcPastMedianTime(node)
-		if err != nil {
-			return err
-		}
-
 		// Initialize the state related to the best block.
 		blockSize := uint64(len(blockBytes))
+		blockWeight := uint64(GetBlockWeight(btcutil.NewBlock(&block)))
 		numTxns := uint64(len(block.Transactions))
-		b.stateSnapshot = newBestState(b.bestNode, blockSize, numTxns,
-			state.totalTxns, medianTime)
+		b.stateSnapshot = newBestState(tip, blockSize, blockWeight,
+			numTxns, state.totalTxns, tip.CalcPastMedianTime())
 
-		isStateInitialized = true
 		return nil
 	})
+}
+
+// deserializeBlockRow parses a value in the block index bucket into a block
+// header and block status bitfield.
+func deserializeBlockRow(blockRow []byte) (*wire.BlockHeader, blockStatus, error) {
+	buffer := bytes.NewReader(blockRow)
+
+	var header wire.BlockHeader
+	err := header.Deserialize(buffer)
 	if err != nil {
-		return err
+		return nil, statusNone, err
 	}
 
-	// There is nothing more to do if the chain state was initialized.
-	if isStateInitialized {
-		return nil
+	statusByte, err := buffer.ReadByte()
+	if err != nil {
+		return nil, statusNone, err
 	}
 
-	// At this point the database has not already been initialized, so
-	// initialize both it and the chain state to the genesis block.
-	return b.createChainState()
+	return &header, blockStatus(statusByte), nil
 }
 
 // dbFetchHeaderByHash uses an existing database transaction to retrieve the
@@ -1246,44 +1331,12 @@ func dbFetchHeaderByHeight(dbTx database.Tx, height int32) (*wire.BlockHeader, e
 	return dbFetchHeaderByHash(dbTx, hash)
 }
 
-// dbFetchBlockByHash uses an existing database transaction to retrieve the raw
-// block for the provided hash, deserialize it, retrieve the appropriate height
-// from the index, and return a btcutil.Block with the height set.
-func dbFetchBlockByHash(dbTx database.Tx, hash *chainhash.Hash) (*btcutil.Block, error) {
-	// First find the height associated with the provided hash in the index.
-	blockHeight, err := dbFetchHeightByHash(dbTx, hash)
-	if err != nil {
-		return nil, err
-	}
-
-	// Load the raw block bytes from the database.
-	blockBytes, err := dbTx.FetchBlock(hash)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create the encapsulated block and set the height appropriately.
-	block, err := btcutil.NewBlockFromBytes(blockBytes)
-	if err != nil {
-		return nil, err
-	}
-	block.SetHeight(blockHeight)
-
-	return block, nil
-}
-
-// dbFetchBlockByHeight uses an existing database transaction to retrieve the
-// raw block for the provided height, deserialize it, and return a btcutil.Block
+// dbFetchBlockByNode uses an existing database transaction to retrieve the
+// raw block for the provided node, deserialize it, and return a btcutil.Block
 // with the height set.
-func dbFetchBlockByHeight(dbTx database.Tx, height int32) (*btcutil.Block, error) {
-	// First find the hash associated with the provided height in the index.
-	hash, err := dbFetchHashByHeight(dbTx, height)
-	if err != nil {
-		return nil, err
-	}
-
+func dbFetchBlockByNode(dbTx database.Tx, node *blockNode) (*btcutil.Block, error) {
 	// Load the raw block bytes from the database.
-	blockBytes, err := dbTx.FetchBlock(hash)
+	blockBytes, err := dbTx.FetchBlock(&node.hash)
 	if err != nil {
 		return nil, err
 	}
@@ -1293,67 +1346,72 @@ func dbFetchBlockByHeight(dbTx database.Tx, height int32) (*btcutil.Block, error
 	if err != nil {
 		return nil, err
 	}
-	block.SetHeight(height)
+	block.SetHeight(node.height)
 
 	return block, nil
 }
 
-// dbMainChainHasBlock uses an existing database transaction to return whether
-// or not the main chain contains the block identified by the provided hash.
-func dbMainChainHasBlock(dbTx database.Tx, hash *chainhash.Hash) bool {
-	hashIndex := dbTx.Metadata().Bucket(hashIndexBucketName)
-	return hashIndex.Get(hash[:]) != nil
+// dbStoreBlockNode stores the block header and validation status to the block
+// index bucket. This overwrites the current entry if there exists one.
+func dbStoreBlockNode(dbTx database.Tx, node *blockNode) error {
+	// Serialize block data to be stored.
+	w := bytes.NewBuffer(make([]byte, 0, blockHdrSize+1))
+	header := node.Header()
+	err := header.Serialize(w)
+	if err != nil {
+		return err
+	}
+	err = w.WriteByte(byte(node.status))
+	if err != nil {
+		return err
+	}
+	value := w.Bytes()
+
+	// Write block header data to block index bucket.
+	blockIndexBucket := dbTx.Metadata().Bucket(blockIndexBucketName)
+	key := blockIndexKey(&node.hash, uint32(node.height))
+	return blockIndexBucket.Put(key, value)
 }
 
-// MainChainHasBlock returns whether or not the block with the given hash is in
-// the main chain.
-//
-// This function is safe for concurrent access.
-func (b *BlockChain) MainChainHasBlock(hash *chainhash.Hash) (bool, error) {
-	var exists bool
-	err := b.db.View(func(dbTx database.Tx) error {
-		exists = dbMainChainHasBlock(dbTx, hash)
+// dbStoreBlock stores the provided block in the database if it is not already
+// there. The full block data is written to ffldb.
+func dbStoreBlock(dbTx database.Tx, block *btcutil.Block) error {
+	hasBlock, err := dbTx.HasBlock(block.Hash())
+	if err != nil {
+		return err
+	}
+	if hasBlock {
 		return nil
-	})
-	return exists, err
+	}
+	return dbTx.StoreBlock(block)
 }
 
-// BlockHeightByHash returns the height of the block with the given hash in the
-// main chain.
-//
-// This function is safe for concurrent access.
-func (b *BlockChain) BlockHeightByHash(hash *chainhash.Hash) (int32, error) {
-	var height int32
-	err := b.db.View(func(dbTx database.Tx) error {
-		var err error
-		height, err = dbFetchHeightByHash(dbTx, hash)
-		return err
-	})
-	return height, err
-}
-
-// BlockHashByHeight returns the hash of the block at the given height in the
-// main chain.
-//
-// This function is safe for concurrent access.
-func (b *BlockChain) BlockHashByHeight(blockHeight int32) (*chainhash.Hash, error) {
-	var hash *chainhash.Hash
-	err := b.db.View(func(dbTx database.Tx) error {
-		var err error
-		hash, err = dbFetchHashByHeight(dbTx, blockHeight)
-		return err
-	})
-	return hash, err
+// blockIndexKey generates the binary key for an entry in the block index
+// bucket. The key is composed of the block height encoded as a big-endian
+// 32-bit unsigned int followed by the 32 byte block hash.
+func blockIndexKey(blockHash *chainhash.Hash, blockHeight uint32) []byte {
+	indexKey := make([]byte, chainhash.HashSize+4)
+	binary.BigEndian.PutUint32(indexKey[0:4], blockHeight)
+	copy(indexKey[4:chainhash.HashSize+4], blockHash[:])
+	return indexKey
 }
 
 // BlockByHeight returns the block at the given height in the main chain.
 //
 // This function is safe for concurrent access.
 func (b *BlockChain) BlockByHeight(blockHeight int32) (*btcutil.Block, error) {
+	// Lookup the block height in the best chain.
+	node := b.bestChain.NodeByHeight(blockHeight)
+	if node == nil {
+		str := fmt.Sprintf("no block at height %d exists", blockHeight)
+		return nil, errNotInMainChain(str)
+	}
+
+	// Load the block from the database and return it.
 	var block *btcutil.Block
 	err := b.db.View(func(dbTx database.Tx) error {
 		var err error
-		block, err = dbFetchBlockByHeight(dbTx, blockHeight)
+		block, err = dbFetchBlockByNode(dbTx, node)
 		return err
 	})
 	return block, err
@@ -1364,604 +1422,20 @@ func (b *BlockChain) BlockByHeight(blockHeight int32) (*btcutil.Block, error) {
 //
 // This function is safe for concurrent access.
 func (b *BlockChain) BlockByHash(hash *chainhash.Hash) (*btcutil.Block, error) {
+	// Lookup the block hash in block index and ensure it is in the best
+	// chain.
+	node := b.index.LookupNode(hash)
+	if node == nil || !b.bestChain.Contains(node) {
+		str := fmt.Sprintf("block %s is not in the main chain", hash)
+		return nil, errNotInMainChain(str)
+	}
+
+	// Load the block from the database and return it.
 	var block *btcutil.Block
 	err := b.db.View(func(dbTx database.Tx) error {
 		var err error
-		block, err = dbFetchBlockByHash(dbTx, hash)
+		block, err = dbFetchBlockByNode(dbTx, node)
 		return err
 	})
 	return block, err
-}
-
-// HeightRange returns a range of block hashes for the given start and end
-// heights.  It is inclusive of the start height and exclusive of the end
-// height.  The end height will be limited to the current main chain height.
-//
-// This function is safe for concurrent access.
-func (b *BlockChain) HeightRange(startHeight, endHeight int32) ([]chainhash.Hash, error) {
-	// Ensure requested heights are sane.
-	if startHeight < 0 {
-		return nil, fmt.Errorf("start height of fetch range must not "+
-			"be less than zero - got %d", startHeight)
-	}
-	if endHeight < startHeight {
-		return nil, fmt.Errorf("end height of fetch range must not "+
-			"be less than the start height - got start %d, end %d",
-			startHeight, endHeight)
-	}
-
-	// There is nothing to do when the start and end heights are the same,
-	// so return now to avoid the chain lock and a database transaction.
-	if startHeight == endHeight {
-		return nil, nil
-	}
-
-	// Grab a lock on the chain to prevent it from changing due to a reorg
-	// while building the hashes.
-	b.chainLock.RLock()
-	defer b.chainLock.RUnlock()
-
-	// When the requested start height is after the most recent best chain
-	// height, there is nothing to do.
-	latestHeight := b.bestNode.height
-	if startHeight > latestHeight {
-		return nil, nil
-	}
-
-	// Limit the ending height to the latest height of the chain.
-	if endHeight > latestHeight+1 {
-		endHeight = latestHeight + 1
-	}
-
-	// Fetch as many as are available within the specified range.
-	var hashList []chainhash.Hash
-	err := b.db.View(func(dbTx database.Tx) error {
-		hashes := make([]chainhash.Hash, 0, endHeight-startHeight)
-		for i := startHeight; i < endHeight; i++ {
-			hash, err := dbFetchHashByHeight(dbTx, i)
-			if err != nil {
-				return err
-			}
-			hashes = append(hashes, *hash)
-		}
-
-		// Set the list to be returned to the constructed list.
-		hashList = hashes
-		return nil
-	})
-	return hashList, err
-}
-
-// -----------------------------------------------------------------------------
-// The threshold state consists of individual threshold cache buckets for each
-// cache id under one main threshold state bucket.  Each threshold cache bucket
-// contains entries keyed by the block hash for the final block in each window
-// and their associated threshold states as well as the associated deployment
-// parameters.
-//
-// The serialized value format is for each cache entry keyed by hash is:
-//
-//   <thresholdstate>
-//
-//   Field             Type      Size
-//   threshold state   uint8     1 byte
-//
-//
-// In addition, the threshold cache buckets for deployments contain the specific
-// deployment parameters they were created with.  This allows the cache
-// invalidation when there any changes to their definitions.
-//
-// The serialized value format for the deployment parameters is:
-//
-//   <bit number><start time><expire time>
-//
-//   Field            Type      Size
-//   bit number       uint8     1 byte
-//   start time       uint64    8 bytes
-//   expire time      uint64    8 bytes
-//
-//
-// Finally, the main threshold bucket also contains the number of stored
-// deployment buckets as described above.
-//
-// The serialized value format for the number of stored deployment buckets is:
-//
-//   <num deployments>
-//
-//   Field             Type      Size
-//   num deployments   uint32    4 bytes
-// -----------------------------------------------------------------------------
-
-// serializeDeploymentCacheParams serializes the parameters for the passed
-// deployment into a single byte slice according to the format described in
-// detail above.
-func serializeDeploymentCacheParams(deployment *chaincfg.ConsensusDeployment) []byte {
-	serialized := make([]byte, 1+8+8)
-	serialized[0] = deployment.BitNumber
-	byteOrder.PutUint64(serialized[1:], deployment.StartTime)
-	byteOrder.PutUint64(serialized[9:], deployment.ExpireTime)
-	return serialized
-}
-
-// deserializeDeploymentCacheParams deserializes the passed serialized
-// deployment cache parameters into a deployment struct.
-func deserializeDeploymentCacheParams(serialized []byte) (chaincfg.ConsensusDeployment, error) {
-	// Ensure the serialized data has enough bytes to properly deserialize
-	// the bit number, start time, and expire time.
-	if len(serialized) != 1+8+8 {
-		return chaincfg.ConsensusDeployment{}, database.Error{
-			ErrorCode:   database.ErrCorruption,
-			Description: "corrupt deployment cache state",
-		}
-	}
-
-	var deployment chaincfg.ConsensusDeployment
-	deployment.BitNumber = serialized[0]
-	deployment.StartTime = byteOrder.Uint64(serialized[1:])
-	deployment.ExpireTime = byteOrder.Uint64(serialized[9:])
-	return deployment, nil
-}
-
-// dbPutDeploymentCacheParams uses an existing database transaction to update
-// the deployment cache params with the given values.
-func dbPutDeploymentCacheParams(bucket database.Bucket, deployment *chaincfg.ConsensusDeployment) error {
-	serialized := serializeDeploymentCacheParams(deployment)
-	return bucket.Put(deploymentStateKeyName, serialized)
-}
-
-// dbFetchDeploymentCacheParams uses an existing database transaction to
-// retrieve the deployment parameters from the given bucket, deserialize them,
-// and returns the resulting deployment struct.
-func dbFetchDeploymentCacheParams(bucket database.Bucket) (chaincfg.ConsensusDeployment, error) {
-	serialized := bucket.Get(deploymentStateKeyName)
-	return deserializeDeploymentCacheParams(serialized)
-}
-
-// serializeNumDeployments serializes the parameters for the passed number of
-// deployments into a single byte slice according to the format described in
-// detail above.
-func serializeNumDeployments(numDeployments uint32) []byte {
-	serialized := make([]byte, 4)
-	byteOrder.PutUint32(serialized, numDeployments)
-	return serialized
-}
-
-// deserializeDeploymentCacheParams deserializes the passed serialized
-// number of deployments.
-func deserializeNumDeployments(serialized []byte) (uint32, error) {
-	if len(serialized) != 4 {
-		return 0, database.Error{
-			ErrorCode:   database.ErrCorruption,
-			Description: "corrupt stored number of deployments",
-		}
-	}
-	return byteOrder.Uint32(serialized), nil
-}
-
-// dbPutNumDeployments uses an existing database transaction to update the
-// number of deployments to the given value.
-func dbPutNumDeployments(bucket database.Bucket, numDeployments uint32) error {
-	serialized := serializeNumDeployments(numDeployments)
-	return bucket.Put(numDeploymentsKeyName, serialized)
-}
-
-// dbFetchNumDeployments uses an existing database transaction to retrieve the
-// number of deployments, deserialize it, and returns the result.
-func dbFetchNumDeployments(bucket database.Bucket) (uint32, error) {
-	// Ensure the serialized data has enough bytes to properly deserialize
-	// the number of stored deployments.
-	serialized := bucket.Get(numDeploymentsKeyName)
-	return deserializeNumDeployments(serialized)
-}
-
-// thresholdCacheBucket returns the serialized bucket name to use for a
-// threshold cache given a prefix and an ID.
-func thresholdCacheBucket(prefix []byte, id uint32) []byte {
-	bucketName := make([]byte, len(prefix)+4)
-	copy(bucketName, prefix)
-	byteOrder.PutUint32(bucketName[len(bucketName)-4:], id)
-	return bucketName
-}
-
-// dbPutThresholdState uses an existing database transaction to update or add
-// the rule change threshold state for the provided block hash.
-func dbPutThresholdState(bucket database.Bucket, hash chainhash.Hash, state ThresholdState) error {
-	// Add the block hash to threshold state mapping.
-	var serializedState [1]byte
-	serializedState[0] = byte(state)
-	return bucket.Put(hash[:], serializedState[:])
-}
-
-// dbPutThresholdCaches uses an existing database transaction to update the
-// provided threshold state caches using the given bucket prefix.
-func dbPutThresholdCaches(dbTx database.Tx, caches []thresholdStateCache, bucketPrefix []byte) error {
-	// Loop through each of the defined cache IDs in the provided cache and
-	// populate the associated bucket with all of the block hash to
-	// threshold state mappings for it.
-	cachesBucket := dbTx.Metadata().Bucket(thresholdBucketName)
-	for i := uint32(0); i < uint32(len(caches)); i++ {
-		cache := &caches[i]
-		if len(cache.dbUpdates) == 0 {
-			continue
-		}
-
-		cacheIDBucketName := thresholdCacheBucket(bucketPrefix, i)
-		bucket := cachesBucket.Bucket(cacheIDBucketName)
-		for blockHash, state := range cache.dbUpdates {
-			err := dbPutThresholdState(bucket, blockHash, state)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-// putThresholdCaches uses an existing database transaction to update the
-// threshold state caches.
-func (b *BlockChain) putThresholdCaches(dbTx database.Tx) error {
-	err := dbPutThresholdCaches(dbTx, b.deploymentCaches,
-		deploymentBucketName)
-	if err != nil {
-		return err
-	}
-
-	return dbPutThresholdCaches(dbTx, b.warningCaches, warningBucketName)
-}
-
-// markThresholdCachesFlushed clears any pending updates to be written from
-// threshold state caches.  Callers are intended to call this after the pending
-// updates have been successfully written to the database via the
-// putThresholdCaches function and its associated database transation is closed.
-// This approach is taken to ensure the memory state is not updated until after
-// the atomic database update was successful.
-func (b *BlockChain) markThresholdCachesFlushed() {
-	for i := 0; i < len(b.deploymentCaches); i++ {
-		b.deploymentCaches[i].MarkFlushed()
-	}
-	for i := 0; i < len(b.warningCaches); i++ {
-		b.warningCaches[i].MarkFlushed()
-	}
-}
-
-// dbFetchThresholdCaches uses an existing database transaction to retrieve
-// the threshold state caches from the provided bucket prefix into the given
-// cache parameter.  When the db does not contain any information for a specific
-// id within that cache, that entry will simply be empty.
-func dbFetchThresholdCaches(dbTx database.Tx, caches []thresholdStateCache, bucketPrefix []byte) error {
-	// Nothing to load if the main threshold state caches bucket
-	// doesn't exist.
-	cachesBucket := dbTx.Metadata().Bucket(thresholdBucketName)
-	if cachesBucket == nil {
-		return nil
-	}
-
-	// Loop through each of the cache IDs and load any saved threshold
-	// states.
-	for i := 0; i < len(caches); i++ {
-		// Nothing to do for this cache ID if there is no bucket for it.
-		cacheIDBucketName := thresholdCacheBucket(bucketPrefix, uint32(i))
-		cacheIDBucket := cachesBucket.Bucket(cacheIDBucketName[:])
-		if cacheIDBucket == nil {
-			continue
-		}
-
-		// Load all of the cached block hash to threshold state mappings
-		// from the bucket.
-		err := cacheIDBucket.ForEach(func(k, v []byte) error {
-			// Skip non-hash entries.
-			if len(k) != chainhash.HashSize {
-				return nil
-			}
-
-			var hash chainhash.Hash
-			copy(hash[:], k)
-			caches[i].entries[hash] = ThresholdState(v[0])
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// invalidateThresholdCaches removes any threshold state caches that are no
-// longer valid.  This can happen if a deployment ID is changed such as when it
-// is reused, or if it is reordered in the parameter definitions.  It is also
-// necessary for specific bits in the warning cache when deployment definitions
-// are added and removed since it could change the expected block versions and
-// hence potentially change the result of the warning states for that bit.
-func (b *BlockChain) invalidateThresholdCaches(cachesBucket database.Bucket) error {
-	deployments := b.chainParams.Deployments[:]
-
-	// Remove any stored deployments that are no longer defined along with
-	// the warning cache associated with their bits.
-	numStoredDeployments, err := dbFetchNumDeployments(cachesBucket)
-	if err != nil {
-		return err
-	}
-	definedDeployments := uint32(len(deployments))
-	for i := definedDeployments; i < numStoredDeployments; i++ {
-		// Nothing to do when nothing is stored for the deployment.
-		deployBucketKey := thresholdCacheBucket(deploymentBucketName, i)
-		deployBucket := cachesBucket.Bucket(deployBucketKey)
-		if deployBucket == nil {
-			continue
-		}
-
-		// Load the deployment details the cache was created for from
-		// the database.
-		stored, err := dbFetchDeploymentCacheParams(deployBucket)
-		if err != nil {
-			return err
-		}
-
-		// Remove the warning cache for the bit associated with the old
-		// deployment definition.
-		oldBit := uint32(stored.BitNumber)
-		bn := thresholdCacheBucket(warningBucketName, oldBit)
-		err = cachesBucket.DeleteBucket(bn)
-		if err != nil && !isDbBucketNotFoundErr(err) {
-			return err
-		}
-
-		// Remove deployment state and cache.
-		err = cachesBucket.DeleteBucket(deployBucketKey)
-		if err != nil && !isDbBucketNotFoundErr(err) {
-			return err
-		}
-		log.Debugf("Removed threshold state caches for deployment %d "+
-			"and warning bit %d", i, oldBit)
-	}
-
-	// Remove any deployment caches that no longer match the associated
-	// deployment definition.
-	for i := uint32(0); i < uint32(len(deployments)); i++ {
-		// Remove the warning cache for the bit associated with the new
-		// deployment definition if nothing is already stored for the
-		// deployment.
-		deployBucketKey := thresholdCacheBucket(deploymentBucketName, i)
-		deployBucket := cachesBucket.Bucket(deployBucketKey)
-		if deployBucket == nil {
-			// Remove the warning cache for the bit associated with
-			// the new deployment definition.
-			newBit := uint32(deployments[i].BitNumber)
-			bn := thresholdCacheBucket(warningBucketName, newBit)
-			err = cachesBucket.DeleteBucket(bn)
-			if err != nil && !isDbBucketNotFoundErr(err) {
-				return err
-			}
-			log.Debugf("Removed threshold state cache for warning "+
-				"bit %d ", newBit)
-			continue
-		}
-
-		// Load the deployment details the cache was created for from
-		// the database, compare them against the currently defined
-		// deployment, and invalidate the relevant caches if they don't
-		// match.
-		stored, err := dbFetchDeploymentCacheParams(deployBucket)
-		if err != nil {
-			return err
-		}
-		if stored != deployments[i] {
-			// Remove deployment state and cache.
-			err := cachesBucket.DeleteBucket(deployBucketKey)
-			if err != nil && !isDbBucketNotFoundErr(err) {
-				return err
-			}
-
-			// Remove the warning cache for the bit associated with
-			// the new deployment definition.
-			newBit := uint32(deployments[i].BitNumber)
-			bn := thresholdCacheBucket(warningBucketName, newBit)
-			err = cachesBucket.DeleteBucket(bn)
-			if err != nil && !isDbBucketNotFoundErr(err) {
-				return err
-			}
-
-			// Remove the warning cache for the bit associated with
-			// the old deployment definition if it is different than
-			// the new one.
-			oldBit := uint32(stored.BitNumber)
-			if oldBit == newBit {
-				log.Debugf("Removed threshold state caches for "+
-					"deployment %d and warning bit %d", i,
-					newBit)
-				continue
-			}
-			bn = thresholdCacheBucket(warningBucketName, oldBit)
-			err = cachesBucket.DeleteBucket(bn)
-			if err != nil && !isDbBucketNotFoundErr(err) {
-				return err
-			}
-			log.Debugf("Removed threshold state caches for "+
-				"deployment %d and warning bits %d and %d", i,
-				oldBit, newBit)
-		}
-	}
-
-	return nil
-}
-
-// initThresholdCacheBuckets creates any missing buckets needed for the defined
-// threshold caches and populates them with state-related details so they can
-// be invalidated as needed.
-func (b *BlockChain) initThresholdCacheBuckets(meta database.Bucket) error {
-	// Create overall bucket that houses all of the threshold caches and
-	// their related state as needed.
-	cachesBucket, err := meta.CreateBucketIfNotExists(thresholdBucketName)
-	if err != nil {
-		return err
-	}
-
-	// Update the number of stored deployment as needed.
-	definedDeployments := uint32(len(b.deploymentCaches))
-	storedDeployments, err := dbFetchNumDeployments(cachesBucket)
-	if err != nil || storedDeployments != definedDeployments {
-		err := dbPutNumDeployments(cachesBucket, definedDeployments)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Create buckets for each of the deployment caches as needed, and
-	// populate the created buckets with the specific deployment details so
-	// that the cache(s) can be invalidated properly with future updates.
-	for i := uint32(0); i < definedDeployments; i++ {
-		name := thresholdCacheBucket(deploymentBucketName, i)
-		if bucket := cachesBucket.Bucket(name); bucket != nil {
-			continue
-		}
-
-		deployBucket, err := cachesBucket.CreateBucket(name)
-		if err != nil {
-			return err
-		}
-
-		deployment := &b.chainParams.Deployments[i]
-		err = dbPutDeploymentCacheParams(deployBucket, deployment)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Create buckets for each of the warning caches as needed.
-	for i := uint32(0); i < uint32(len(b.warningCaches)); i++ {
-		name := thresholdCacheBucket(warningBucketName, i)
-		_, err := cachesBucket.CreateBucketIfNotExists(name)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// initThresholdCaches initializes the threshold state caches from the database.
-// When the db does not yet contain any information for a specific threshold
-// cache or a given id within that cache, it will simply be empty which will
-// lead to it being calculated as needed.
-func (b *BlockChain) initThresholdCaches() error {
-	// Create and initialize missing threshold state cache buckets and
-	// remove any that are no longer valid.
-	err := b.db.Update(func(dbTx database.Tx) error {
-		meta := dbTx.Metadata()
-		cachesBucket := meta.Bucket(thresholdBucketName)
-		if cachesBucket != nil {
-			err := b.invalidateThresholdCaches(cachesBucket)
-			if err != nil {
-				return err
-			}
-		}
-
-		// Create all cache buckets as needed.
-		return b.initThresholdCacheBuckets(meta)
-	})
-	if err != nil {
-		return err
-	}
-
-	// Load the deployment caches.
-	err = b.db.View(func(dbTx database.Tx) error {
-		// Load the deployment threshold states.
-		err := dbFetchThresholdCaches(dbTx, b.deploymentCaches,
-			deploymentBucketName)
-		if err != nil {
-			return err
-		}
-
-		// Load the warning threshold states.
-		return dbFetchThresholdCaches(dbTx, b.warningCaches,
-			warningBucketName)
-	})
-	if err != nil {
-		return err
-	}
-
-	// Inform the user the states might take a while to recalculate if any
-	// of the threshold state caches aren't populated.
-	var showMsg bool
-	for i := 0; i < len(b.warningCaches); i++ {
-		if len(b.warningCaches[i].entries) == 0 {
-			showMsg = true
-			break
-		}
-	}
-	if !showMsg {
-		for i := 0; i < len(b.deploymentCaches); i++ {
-			if len(b.deploymentCaches[i].entries) == 0 {
-				showMsg = true
-				break
-			}
-		}
-	}
-	if showMsg {
-		log.Info("Recalculating threshold states due to definition " +
-			"change.  This might take a while...")
-	}
-
-	// Get the previous block node.  This function is used over simply
-	// accessing b.bestNode.parent directly as it will dynamically create
-	// previous block nodes as needed.  This helps allow only the pieces of
-	// the chain that are needed to remain in memory.
-	prevNode, err := b.index.PrevNodeFromNode(b.bestNode)
-	if err != nil {
-		return err
-	}
-
-	// Initialize the warning and deployment caches by calculating the
-	// threshold state for each of them.  This will ensure the caches are
-	// populated and any states that needed to be recalculated due to
-	// definition changes is done now.
-	for bit := uint32(0); bit < vbNumBits; bit++ {
-		checker := bitConditionChecker{bit: bit, chain: b}
-		cache := &b.warningCaches[bit]
-		_, err := b.thresholdState(prevNode, checker, cache)
-		if err != nil {
-			return err
-		}
-	}
-	for id := 0; id < len(b.chainParams.Deployments); id++ {
-		deployment := &b.chainParams.Deployments[id]
-		cache := &b.deploymentCaches[id]
-		checker := deploymentChecker{deployment: deployment, chain: b}
-		_, err := b.thresholdState(prevNode, checker, cache)
-		if err != nil {
-			return err
-		}
-	}
-
-	// No warnings about unknown rules or versions until the chain is
-	// current.
-	if b.isCurrent() {
-		// Warn if a high enough percentage of the last blocks have
-		// unexpected versions.
-		if err := b.warnUnknownVersions(b.bestNode); err != nil {
-			return err
-		}
-
-		// Warn if any unknown new rules are either about to activate or
-		// have already been activated.
-		if err := b.warnUnknownRuleActivations(b.bestNode); err != nil {
-			return err
-		}
-	}
-
-	// Update the cached threshold states in the database as needed.
-	err = b.db.Update(func(dbTx database.Tx) error {
-		return b.putThresholdCaches(dbTx)
-	})
-	if err != nil {
-		return err
-	}
-
-	// Mark all modified entries in the threshold caches as flushed now that
-	// they have been committed to the database.
-	b.markThresholdCachesFlushed()
-
-	return nil
 }

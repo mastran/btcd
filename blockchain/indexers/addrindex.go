@@ -51,6 +51,18 @@ const (
 	// hash.
 	addrKeyTypeScriptHash = 1
 
+	// addrKeyTypePubKeyHash is the address type in an address key which
+	// represents a pay-to-witness-pubkey-hash address. This is required
+	// as the 20-byte data push of a p2wkh witness program may be the same
+	// data push used a p2pkh address.
+	addrKeyTypeWitnessPubKeyHash = 2
+
+	// addrKeyTypeScriptHash is the address type in an address key which
+	// represents a pay-to-witness-script-hash address. This is required,
+	// as p2wsh are distinct from p2sh addresses since they use a new
+	// script template, as well as a 32-byte data push.
+	addrKeyTypeWitnessScriptHash = 3
+
 	// Size of a transaction entry.  It consists of 4 bytes block id + 4
 	// bytes offset + 4 bytes length.
 	txEntrySize = 4 + 4 + 4
@@ -534,6 +546,24 @@ func addrToKey(addr btcutil.Address) ([addrKeySize]byte, error) {
 		result[0] = addrKeyTypePubKeyHash
 		copy(result[1:], addr.AddressPubKeyHash().Hash160()[:])
 		return result, nil
+
+	case *btcutil.AddressWitnessScriptHash:
+		var result [addrKeySize]byte
+		result[0] = addrKeyTypeWitnessScriptHash
+
+		// P2WSH outputs utilize a 32-byte data push created by hashing
+		// the script with sha256 instead of hash160. In order to keep
+		// all address entries within the database uniform and compact,
+		// we use a hash160 here to reduce the size of the salient data
+		// push to 20-bytes.
+		copy(result[1:], btcutil.Hash160(addr.ScriptAddress()))
+		return result, nil
+
+	case *btcutil.AddressWitnessPubKeyHash:
+		var result [addrKeySize]byte
+		result[0] = addrKeyTypeWitnessPubKeyHash
+		copy(result[1:], addr.Hash160()[:])
+		return result, nil
 	}
 
 	return [addrKeySize]byte{}, errUnsupportedAddressType
@@ -621,7 +651,7 @@ func (idx *AddrIndex) Create(dbTx database.Tx) error {
 }
 
 // writeIndexData represents the address index data to be written for one block.
-// It consistens of the address mapped to an ordered list of the transactions
+// It consists of the address mapped to an ordered list of the transactions
 // that involve the address in block.  It is ordered so the transactions can be
 // stored in the order they appear in the block.
 type writeIndexData map[[addrKeySize]byte][]int
@@ -660,7 +690,7 @@ func (idx *AddrIndex) indexPkScript(data writeIndexData, pkScript []byte, txIdx 
 }
 
 // indexBlock extract all of the standard addresses from all of the transactions
-// in the passed block and maps each of them to the assocaited transaction using
+// in the passed block and maps each of them to the associated transaction using
 // the passed map.
 func (idx *AddrIndex) indexBlock(data writeIndexData, block *btcutil.Block, view *blockchain.UtxoViewpoint) {
 	for txIdx, tx := range block.Transactions() {
@@ -928,6 +958,6 @@ func NewAddrIndex(db database.DB, chainParams *chaincfg.Params) *AddrIndex {
 
 // DropAddrIndex drops the address index from the provided database if it
 // exists.
-func DropAddrIndex(db database.DB) error {
-	return dropIndex(db, addrIndexKey, addrIndexName)
+func DropAddrIndex(db database.DB, interrupt <-chan struct{}) error {
+	return dropIndex(db, addrIndexKey, addrIndexName, interrupt)
 }
